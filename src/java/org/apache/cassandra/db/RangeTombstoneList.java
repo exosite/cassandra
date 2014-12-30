@@ -21,8 +21,9 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
+import org.magicwerk.brownies.collections.GapList;
 import java.util.Comparator;
+import java.util.Collections;
 import java.util.Iterator;
 
 import com.google.common.collect.AbstractIterator;
@@ -57,40 +58,36 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
     public static final Serializer serializer = new Serializer();
 
     private final Comparator<ByteBuffer> comparator;
+    private final Comparator<Range> endsComparator;
+    private final Comparator<Range> startsComparator;
 
-    // Note: we don't want to use a List for the markedAts and delTimes to avoid boxing. We could
-    // use a List for starts and ends, but having arrays everywhere is almost simpler.
-    private ByteBuffer[] starts;
-    private ByteBuffer[] ends;
-    private long[] markedAts;
-    private int[] delTimes;
-
-    private int size;
-
-    private RangeTombstoneList(Comparator<ByteBuffer> comparator, ByteBuffer[] starts, ByteBuffer[] ends, long[] markedAts, int[] delTimes, int size)
-    {
-        assert starts.length == ends.length && starts.length == markedAts.length && starts.length == delTimes.length;
-        this.comparator = comparator;
-        this.starts = starts;
-        this.ends = ends;
-        this.markedAts = markedAts;
-        this.delTimes = delTimes;
-        this.size = size;
-    }
+    private GapList<Range> list;
 
     public RangeTombstoneList(Comparator<ByteBuffer> comparator, int capacity)
     {
-        this(comparator, new ByteBuffer[capacity], new ByteBuffer[capacity], new long[capacity], new int[capacity], 0);
+        this.comparator = comparator;
+        this.list = new GapList<Range>(capacity);
+        this.endsComparator = new EndsComparator();
+        this.startsComparator = new StartsComparator();
     }
+
+    public RangeTombstoneList(RangeTombstoneList that)
+    {
+        this.comparator = that.comparator;
+        this.list = that.list.copy();
+        this.endsComparator = new EndsComparator();
+        this.startsComparator = new StartsComparator();
+    }
+
 
     public boolean isEmpty()
     {
-        return size == 0;
+        return list.isEmpty();
     }
 
     public int size()
     {
-        return size;
+        return list.size();
     }
 
     public Comparator<ByteBuffer> comparator()
@@ -100,17 +97,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
 
     public RangeTombstoneList copy()
     {
-        return new RangeTombstoneList(comparator,
-                                      Arrays.copyOf(starts, size),
-                                      Arrays.copyOf(ends, size),
-                                      Arrays.copyOf(markedAts, size),
-                                      Arrays.copyOf(delTimes, size),
-                                      size);
+        return new RangeTombstoneList(this);
     }
 
     public void add(RangeTombstone tombstone)
     {
-        add(tombstone.min, tombstone.max, tombstone.data.markedForDeleteAt, tombstone.data.localDeletionTime);
+        add(new Range(tombstone.min, tombstone.max, tombstone.data.markedForDeleteAt, tombstone.data.localDeletionTime));
     }
 
     /**
@@ -121,24 +113,43 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
      */
     public void add(ByteBuffer start, ByteBuffer end, long markedAt, int delTime)
     {
+        add(new Range(start, end, markedAt, delTime));
+    }
+
+     /**
+     * Adds a new range tombstone.
+     *
+     * This method will be faster if the new tombstone sort after all the currently existing ones (this is a common use case),
+     * but it doesn't assume it.
+     */
+    public void add(Range range)
+    {
         if (isEmpty())
         {
-            addInternal(0, start, end, markedAt, delTime);
+            list.add(0, range);
             return;
         }
 
-        int c = comparator.compare(ends[size-1], start);
+        int c = comparator.compare(list.peekLast().end, range.start);
 
         // Fast path if we add in sorted order
         if (c < 0)
         {
-            addInternal(size, start, end, markedAt, delTime);
+            list.add(size(), range);
+        }
+        // Fast path if we add in sorted order #2
+        else if (comparator.compare(range.end, list.peekFirst().start) < 0)
+        {
+            list.add(0, range);
         }
         else
         {
             // Note: insertFrom expect i to be the insertion point in term of interval ends
-            int pos = Arrays.binarySearch(ends, 0, size, start, comparator);
-            insertFrom((pos >= 0 ? pos : -pos-1), start, end, markedAt, delTime);
+            ByteBuffer end = range.end;
+            range.end = range.start;
+            int pos = Collections.binarySearch(list, range, endsComparator);
+            range.end = end;
+            insertFrom((pos >= 0 ? pos : -pos-1), range);
         }
     }
 
@@ -174,20 +185,22 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
          * But let's not crank up a logarithm computation for that. Long story short, merging will be a bad choice only
          * if this list size is lot bigger that the other one, so let's keep it simple.
          */
-        if (size > 10 * tombstones.size)
+        if (size() > 10 * tombstones.size())
         {
-            for (int i = 0; i < tombstones.size; i++)
-                add(tombstones.starts[i], tombstones.ends[i], tombstones.markedAts[i], tombstones.delTimes[i]);
+            for (int i = 0; i < tombstones.size(); i++)
+                add(tombstones.list.get(i));
         }
         else
         {
             int i = 0;
             int j = 0;
-            while (i < size && j < tombstones.size)
+            while (i < size() && j < tombstones.size())
             {
-                if (comparator.compare(tombstones.starts[j], ends[i]) <= 0)
+                Range tomb = tombstones.list.get(j);
+                Range local = list.get(i);
+                if (comparator.compare(tomb.start, local.end) <= 0)
                 {
-                    insertFrom(i, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);
+                    insertFrom(i, tomb);
                     j++;
                 }
                 else
@@ -195,9 +208,9 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
                     i++;
                 }
             }
-            // Addds the remaining ones from tombstones if any (note that addInternal will increment size if relevant).
-            for (; j < tombstones.size; j++)
-                addInternal(size, tombstones.starts[j], tombstones.ends[j], tombstones.markedAts[j], tombstones.delTimes[j]);
+            // Addds the remaining ones from tombstones if any (note that list.add will increment size if relevant).
+            for (; j < tombstones.size(); j++)
+                list.add(size(), tombstones.list.get(j));
         }
     }
 
@@ -208,7 +221,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
     public boolean isDeleted(ByteBuffer name, long timestamp)
     {
         int idx = searchInternal(name);
-        return idx >= 0 && markedAts[idx] >= timestamp;
+        return idx >= 0 && list.get(idx).markedAt >= timestamp;
     }
 
     /**
@@ -225,7 +238,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
      */
     public DeletionTime search(ByteBuffer name) {
         int idx = searchInternal(name);
-        return idx < 0 ? null : new DeletionTime(markedAts[idx], delTimes[idx]);
+        if (idx >= 0)
+        {
+            Range range = list.get(idx);
+            return new DeletionTime(range.markedAt, range.delTime);
+        }
+        return null;
     }
 
     private int searchInternal(ByteBuffer name)
@@ -233,15 +251,20 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
         if (isEmpty())
             return -1;
 
-        int pos = Arrays.binarySearch(starts, 0, size, name, comparator);
+        Range search = new Range(name, name, 0, 0);
+
+        int pos = Collections.binarySearch(list, search, startsComparator);
         if (pos >= 0)
         {
             // We're exactly on an interval start. The one subtility is that we need to check if
             // the previous is not equal to us and doesn't have a higher marked at
-            if (pos > 0 && comparator.compare(name, ends[pos-1]) == 0 && markedAts[pos-1] > markedAts[pos])
-                return pos-1;
-            else
-                return pos;
+            if (pos > 0)
+            {
+                Range last = list.get(pos - 1);
+                if (comparator.compare(name, last.end) == 0 && last.markedAt > list.get(pos).markedAt)
+                    return pos-1;
+            }
+            return pos;
         }
         else
         {
@@ -250,18 +273,18 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
             if (idx < 0)
                 return -1;
 
-            return comparator.compare(name, ends[idx]) <= 0 ? idx : -1;
+            return comparator.compare(name, list.get(idx).end) <= 0 ? idx : -1;
         }
     }
 
     public int dataSize()
     {
-        int dataSize = TypeSizes.NATIVE.sizeof(size);
-        for (int i = 0; i < size; i++)
+        int dataSize = TypeSizes.NATIVE.sizeof(size());
+        for (Range range : list)
         {
-            dataSize += starts[i].remaining() + ends[i].remaining();
-            dataSize += TypeSizes.NATIVE.sizeof(markedAts[i]);
-            dataSize += TypeSizes.NATIVE.sizeof(delTimes[i]);
+            dataSize += range.start.remaining() + range.end.remaining();
+            dataSize += TypeSizes.NATIVE.sizeof(range.markedAt);
+            dataSize += TypeSizes.NATIVE.sizeof(range.delTime);
         }
         return dataSize;
     }
@@ -269,23 +292,23 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
     public long minMarkedAt()
     {
         long min = Long.MAX_VALUE;
-        for (int i = 0; i < size; i++)
-            min = Math.min(min, markedAts[i]);
+        for (Range range : list)
+            min = Math.min(min, range.markedAt);
         return min;
     }
 
     public long maxMarkedAt()
     {
         long max = Long.MIN_VALUE;
-        for (int i = 0; i < size; i++)
-            max = Math.max(max, markedAts[i]);
+        for (Range range : list)
+            max = Math.max(max, range.markedAt);
         return max;
     }
 
     public void updateAllTimestamp(long timestamp)
     {
-        for (int i = 0; i < size; i++)
-            markedAts[i] = timestamp;
+        for (Range range : list)
+            range.markedAt = timestamp;
     }
 
     /**
@@ -293,13 +316,9 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
      */
     public void purge(int gcBefore)
     {
-        int j = 0;
-        for (int i = 0; i < size; i++)
-        {
-            if (delTimes[i] >= gcBefore)
-                setInternal(j++, starts[i], ends[i], markedAts[i], delTimes[i]);
-        }
-        size = j;
+        for (int i = 0; i < size(); i++)
+            if (list.get(i).delTime < gcBefore)
+                list.remove(i--);
     }
 
     /**
@@ -307,9 +326,9 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
      */
     public boolean hasPurgeableTombstones(int gcBefore)
     {
-        for (int i = 0; i < size; i++)
+        for (Range range : list)
         {
-            if (delTimes[i] < gcBefore)
+            if (range.delTime < gcBefore)
                 return true;
         }
         return false;
@@ -319,15 +338,15 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
     {
         return new AbstractIterator<RangeTombstone>()
         {
-            private int idx;
+            private Iterator<Range> iter = list.iterator();
 
             protected RangeTombstone computeNext()
             {
-                if (idx >= size)
+                if (!iter.hasNext())
                     return endOfData();
 
-                RangeTombstone t = new RangeTombstone(starts[idx], ends[idx], markedAts[idx], delTimes[idx]);
-                idx++;
+                Range range = iter.next();
+                RangeTombstone t = new RangeTombstone(range.start,  range.end, range.markedAt, range.delTime);
                 return t;
             }
         };
@@ -386,18 +405,12 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
         if(!(o instanceof RangeTombstoneList))
             return false;
         RangeTombstoneList that = (RangeTombstoneList)o;
-        if (size != that.size)
+        if (size() != that.size())
             return false;
 
-        for (int i = 0; i < size; i++)
+        for (int i = 0; i < size(); i++)
         {
-            if (!starts[i].equals(that.starts[i]))
-                return false;
-            if (!ends[i].equals(that.ends[i]))
-                return false;
-            if (markedAts[i] != that.markedAts[i])
-                return false;
-            if (delTimes[i] != that.delTimes[i])
+            if (!list.get(i).equals(that.list.get(i)))
                 return false;
         }
         return true;
@@ -406,24 +419,19 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
     @Override
     public final int hashCode()
     {
-        int result = size;
-        for (int i = 0; i < size; i++)
+        int result = size();
+        for (Range range : list)
         {
-            result += starts[i].hashCode() + ends[i].hashCode();
-            result += (int)(markedAts[i] ^ (markedAts[i] >>> 32));
-            result += delTimes[i];
+            result += range.start.hashCode() + range.end.hashCode();
+            result += (int)(range.markedAt ^ (range.markedAt >>> 32));
+            result += range.delTime;
         }
         return result;
     }
 
     private static void copyArrays(RangeTombstoneList src, RangeTombstoneList dst)
     {
-        dst.grow(src.size);
-        System.arraycopy(src.starts, 0, dst.starts, 0, src.size);
-        System.arraycopy(src.ends, 0, dst.ends, 0, src.size);
-        System.arraycopy(src.markedAts, 0, dst.markedAts, 0, src.size);
-        System.arraycopy(src.delTimes, 0, dst.delTimes, 0, src.size);
-        dst.size = src.size;
+        dst.list = src.list.copy();
     }
 
     /*
@@ -440,34 +448,35 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
      * conditions).
      *
      */
-    private void insertFrom(int i, ByteBuffer start, ByteBuffer end, long markedAt, int delTime)
+    private void insertFrom(int i, Range incoming)
     {
-        while (i < size)
+        while (i < size())
         {
-            assert i == 0 || comparator.compare(ends[i-1], start) <= 0;
+            assert i == 0 || comparator.compare(list.get(i-1).end, incoming.start) <= 0;
 
-            int c = comparator.compare(start, ends[i]);
+            Range current = list.get(i);
+            int c = comparator.compare(incoming.start, current.end);
             assert c <= 0;
             if (c == 0)
             {
                 // If start == ends[i], then we can insert from the next one (basically the new element
                 // really start at the next element), except for the case where starts[i] == ends[i].
                 // In this latter case, if we were to move to next element, we could end up with ...[x, x][x, x]...
-                if (comparator.compare(starts[i], ends[i]) == 0)
+                if (comparator.compare(current.start, current.end) == 0)
                 {
                     // The current element cover a single value which is equal to the start of the inserted
                     // element. If the inserted element overwrites the current one, just remove the current
                     // (it's included in what we insert) and proceed with the insert.
-                    if (markedAt > markedAts[i])
+                    if (incoming.markedAt > current.markedAt)
                     {
-                        removeInternal(i);
+                        list.remove(i);
                         continue;
                     }
 
                     // Otherwise (the current singleton interval override the new one), we want to leave the
                     // current element and move to the next, unless start == end since that means the new element
                     // is in fact fully covered by the current one (so we're done)
-                    if (comparator.compare(start, end) == 0)
+                    if (comparator.compare(incoming.start, incoming.end) == 0)
                         return;
                 }
                 i++;
@@ -475,38 +484,38 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
             }
 
             // Do we overwrite the current element?
-            if (markedAt > markedAts[i])
+            if (incoming.markedAt > current.markedAt)
             {
                 // We do overwrite.
 
                 // First deal with what might come before the newly added one.
-                if (comparator.compare(starts[i], start) < 0)
+                if (comparator.compare(current.start, incoming.start) < 0)
                 {
-                    addInternal(i, starts[i], start, markedAts[i], delTimes[i]);
+                    list.add(i, new Range(current.start, incoming.start, current.markedAt, current.delTime));
                     i++;
                     // We don't need to do the following line, but in spirit that's what we want to do
-                    // setInternal(i, start, ends[i], markedAts, delTime])
+                    // list.set(i, start, ends[i], markedAts, delTime])
                 }
 
                 // now, start <= starts[i]
 
                 // Does the new element stops before/at the current one,
-                int endCmp = comparator.compare(end, starts[i]);
+                int endCmp = comparator.compare(incoming.end, current.start);
                 if (endCmp <= 0)
                 {
                     // Here start <= starts[i] and end <= starts[i]
                     // This means the current element is before the current one. However, one special
                     // case is if end == starts[i] and starts[i] == ends[i]. In that case,
                     // the new element entirely overwrite the current one and we can just overwrite
-                    if (endCmp == 0 && comparator.compare(starts[i], ends[i]) == 0)
-                        setInternal(i, start, end, markedAt, delTime);
+                    if (endCmp == 0 && comparator.compare(current.start, current.end) == 0)
+                        list.set(i, incoming);
                     else
-                        addInternal(i, start, end, markedAt, delTime);
+                        list.add(i, incoming);
                     return;
                 }
 
                 // Do we overwrite the current element fully?
-                int cmp = comparator.compare(ends[i], end);
+                int cmp = comparator.compare(current.end, incoming.end);
                 if (cmp <= 0)
                 {
                     // We do overwrite fully:
@@ -514,26 +523,26 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
                     // on with the next element (with the new inserted start == current end).
 
                     // If we're on the last element, we can optimize
-                    if (i == size-1)
+                    if (i == size()-1)
                     {
-                        setInternal(i, start, end, markedAt, delTime);
+                        list.set(i, incoming);
                         return;
                     }
 
-                    setInternal(i, start, ends[i], markedAt, delTime);
+                    list.set(i, new Range(incoming.start, current.end, incoming.markedAt, incoming.delTime));
                     if (cmp == 0)
                         return;
 
-                    start = ends[i];
+                    incoming = new Range(current.end, incoming.end, incoming.markedAt, incoming.delTime);
                     i++;
                 }
                 else
                 {
                     // We don't ovewrite fully. Insert the new interval, and then update the now next
                     // one to reflect the not overwritten parts. We're then done.
-                    addInternal(i, start, end, markedAt, delTime);
+                    list.add(i, incoming);
                     i++;
-                    setInternal(i, end, ends[i], markedAts[i], delTimes[i]);
+                    list.set(i, new Range(incoming.end, current.end, current.markedAt, current.delTime));
                     return;
                 }
             }
@@ -542,17 +551,17 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
                 // we don't overwrite the current element
 
                 // If the new interval starts before the current one, insert that new interval
-                if (comparator.compare(start, starts[i]) < 0)
+                if (comparator.compare(incoming.start, current.start) < 0)
                 {
                     // If we stop before the start of the current element, just insert the new
                     // interval and we're done; otherwise insert until the beginning of the
                     // current element
-                    if (comparator.compare(end, starts[i]) <= 0)
+                    if (comparator.compare(incoming.end, current.start) <= 0)
                     {
-                        addInternal(i, start, end, markedAt, delTime);
+                        list.add(i, incoming);
                         return;
                     }
-                    addInternal(i, start, starts[i], markedAt, delTime);
+                    list.add(i, new Range(incoming.start, current.start, incoming.markedAt, incoming.delTime));
                     i++;
                 }
 
@@ -560,132 +569,16 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
                 // some residual parts after ...
 
                 // ... unless we don't extend beyond it.
-                if (comparator.compare(end, ends[i]) <= 0)
+                if (comparator.compare(incoming.end, current.end) <= 0)
                     return;
 
-                start = ends[i];
+                incoming = new Range(current.end, incoming.end, incoming.markedAt, incoming.delTime);
                 i++;
             }
         }
 
         // If we got there, then just insert the remainder at the end
-        addInternal(i, start, end, markedAt, delTime);
-    }
-
-    private int capacity()
-    {
-        return starts.length;
-    }
-
-    /*
-     * Adds the new tombstone at index i, growing and/or moving elements to make room for it.
-     */
-    private void addInternal(int i, ByteBuffer start, ByteBuffer end, long markedAt, int delTime)
-    {
-        assert i >= 0;
-
-        if (size == capacity())
-            growToFree(i);
-        else if (i < size)
-            moveElements(i);
-
-        setInternal(i, start, end, markedAt, delTime);
-        size++;
-    }
-
-    private void removeInternal(int i)
-    {
-        assert i >= 0;
-
-        System.arraycopy(starts, i+1, starts, i, size - i - 1);
-        System.arraycopy(ends, i+1, ends, i, size - i - 1);
-        System.arraycopy(markedAts, i+1, markedAts, i, size - i - 1);
-        System.arraycopy(delTimes, i+1, delTimes, i, size - i - 1);
-
-        --size;
-        starts[size] = null;
-        ends[size] = null;
-    }
-
-    /*
-     * Grow the arrays, leaving index i "free" in the process.
-     */
-    private void growToFree(int i)
-    {
-        int newLength = (capacity() * 3) / 2 + 1;
-        grow(i, newLength);
-    }
-
-    /*
-     * Grow the arrays to match newLength capacity.
-     */
-    private void grow(int newLength)
-    {
-        if (capacity() < newLength)
-            grow(-1, newLength);
-    }
-
-    private void grow(int i, int newLength)
-    {
-        starts = grow(starts, size, newLength, i);
-        ends = grow(ends, size, newLength, i);
-        markedAts = grow(markedAts, size, newLength, i);
-        delTimes = grow(delTimes, size, newLength, i);
-    }
-
-    private static ByteBuffer[] grow(ByteBuffer[] a, int size, int newLength, int i)
-    {
-        if (i < 0 || i >= size)
-            return Arrays.copyOf(a, newLength);
-
-        ByteBuffer[] newA = new ByteBuffer[newLength];
-        System.arraycopy(a, 0, newA, 0, i);
-        System.arraycopy(a, i, newA, i+1, size - i);
-        return newA;
-    }
-
-    private static long[] grow(long[] a, int size, int newLength, int i)
-    {
-        if (i < 0 || i >= size)
-            return Arrays.copyOf(a, newLength);
-
-        long[] newA = new long[newLength];
-        System.arraycopy(a, 0, newA, 0, i);
-        System.arraycopy(a, i, newA, i+1, size - i);
-        return newA;
-    }
-
-    private static int[] grow(int[] a, int size, int newLength, int i)
-    {
-        if (i < 0 || i >= size)
-            return Arrays.copyOf(a, newLength);
-
-        int[] newA = new int[newLength];
-        System.arraycopy(a, 0, newA, 0, i);
-        System.arraycopy(a, i, newA, i+1, size - i);
-        return newA;
-    }
-
-    /*
-     * Move elements so that index i is "free", assuming the arrays have at least one free slot at the end.
-     */
-    private void moveElements(int i)
-    {
-        if (i >= size)
-            return;
-
-        System.arraycopy(starts, i, starts, i+1, size - i);
-        System.arraycopy(ends, i, ends, i+1, size - i);
-        System.arraycopy(markedAts, i, markedAts, i+1, size - i);
-        System.arraycopy(delTimes, i, delTimes, i+1, size - i);
-    }
-
-    private void setInternal(int i, ByteBuffer start, ByteBuffer end, long markedAt, int delTime)
-    {
-        starts[i] = start;
-        ends[i] = end;
-        markedAts[i] = markedAt;
-        delTimes[i] = delTime;
+        list.add(i, incoming);
     }
 
     public static class Serializer implements IVersionedSerializer<RangeTombstoneList>
@@ -700,13 +593,13 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
                 return;
             }
 
-            out.writeInt(tombstones.size);
-            for (int i = 0; i < tombstones.size; i++)
+            out.writeInt(tombstones.size());
+            for (Range range : tombstones.list)
             {
-                ByteBufferUtil.writeWithShortLength(tombstones.starts[i], out);
-                ByteBufferUtil.writeWithShortLength(tombstones.ends[i], out);
-                out.writeInt(tombstones.delTimes[i]);
-                out.writeLong(tombstones.markedAts[i]);
+                ByteBufferUtil.writeWithShortLength(range.start, out);
+                ByteBufferUtil.writeWithShortLength(range.end, out);
+                out.writeInt(range.delTime);
+                out.writeLong(range.markedAt);
             }
         }
 
@@ -736,7 +629,7 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
 
                 if (version >= MessagingService.VERSION_20)
                 {
-                    tombstones.setInternal(i, start, end, markedAt, delTime);
+                    tombstones.list.add(new Range(start, end, markedAt, delTime));
                 }
                 else
                 {
@@ -744,13 +637,10 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
                      * The old implementation used to have range sorted by left value, but with potentially
                      * overlapping range. So we need to use the "slow" path.
                      */
-                    tombstones.add(start, end, markedAt, delTime);
+                    tombstones.add(new Range(start, end, markedAt, delTime));
                 }
             }
 
-            // The "slow" path take care of updating the size, but not the fast one
-            if (version >= MessagingService.VERSION_20)
-                tombstones.size = size;
             return tombstones;
         }
 
@@ -759,15 +649,15 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
             if (tombstones == null)
                 return typeSizes.sizeof(0);
 
-            long size = typeSizes.sizeof(tombstones.size);
-            for (int i = 0; i < tombstones.size; i++)
+            long size = typeSizes.sizeof(tombstones.size());
+            for (Range range : tombstones.list)
             {
-                int startSize = tombstones.starts[i].remaining();
+                int startSize = range.start.remaining();
                 size += typeSizes.sizeof((short)startSize) + startSize;
-                int endSize = tombstones.ends[i].remaining();
+                int endSize = range.end.remaining();
                 size += typeSizes.sizeof((short)endSize) + endSize;
-                size += typeSizes.sizeof(tombstones.delTimes[i]);
-                size += typeSizes.sizeof(tombstones.markedAts[i]);
+                size += typeSizes.sizeof(range.delTime);
+                size += typeSizes.sizeof(range.markedAt);
             }
             return size;
         }
@@ -793,16 +683,18 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
 
         public boolean isDeleted(ByteBuffer name, long timestamp)
         {
-            while (idx < size)
+            while (idx < size())
             {
-                int cmp = comparator.compare(name, starts[idx]);
+                Range current = list.get(idx);
+                int cmp = comparator.compare(name, current.start);
                 if (cmp == 0)
                 {
                     // As for searchInternal, we need to check the previous end
-                    if (idx > 0 && comparator.compare(name, ends[idx-1]) == 0 && markedAts[idx-1] > markedAts[idx])
-                        return markedAts[idx-1] >= timestamp;
+                    Range last = idx > 0 ? list.get(idx -1) : null;
+                    if (last != null && comparator.compare(name, last.end) == 0 && last.markedAt > current.markedAt)
+                        return last.markedAt >= timestamp;
                     else
-                        return markedAts[idx] >= timestamp;
+                        return current.markedAt >= timestamp;
                 }
                 else if (cmp < 0)
                 {
@@ -810,13 +702,45 @@ public class RangeTombstoneList implements Iterable<RangeTombstone>
                 }
                 else
                 {
-                    if (comparator.compare(name, ends[idx]) <= 0)
-                        return markedAts[idx] >= timestamp;
+                    if (comparator.compare(name, current.end) <= 0)
+                        return current.markedAt >= timestamp;
                     else
                         idx++;
                 }
             }
             return false;
+        }
+    }
+
+    class EndsComparator implements Comparator<Range>
+    {
+        public int compare(Range a, Range b)
+        {
+            return comparator.compare(a.end, b.end);
+        }
+    }
+
+    class StartsComparator implements Comparator<Range>
+    {
+        public int compare(Range a, Range b)
+        {
+            return comparator.compare(a.start, b.start);
+        }
+    }
+
+    static class Range
+    {
+        public ByteBuffer start;
+        public ByteBuffer end;
+        public long markedAt;
+        public int delTime;
+
+        Range(ByteBuffer start, ByteBuffer end, long markedAt, int delTime)
+        {
+            this.start = start;
+            this.end = end;
+            this.markedAt = markedAt;
+            this.delTime = delTime;
         }
     }
 }
