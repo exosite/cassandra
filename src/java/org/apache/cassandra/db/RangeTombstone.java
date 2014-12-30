@@ -117,8 +117,7 @@ public class RangeTombstone extends Interval<ByteBuffer, DeletionTime> implement
     public static class Tracker
     {
         private final Comparator<ByteBuffer> comparator;
-        private final Deque<RangeTombstone> ranges = new ArrayDeque<RangeTombstone>();
-        private final SortedSet<RangeTombstone> maxOrderingSet = new TreeSet<RangeTombstone>(new Comparator<RangeTombstone>()
+        private final TreeSet<RangeTombstone> maxOrderingSet = new TreeSet<RangeTombstone>(new Comparator<RangeTombstone>()
         {
             public int compare(RangeTombstone t1, RangeTombstone t2)
             {
@@ -142,7 +141,7 @@ public class RangeTombstone extends Interval<ByteBuffer, DeletionTime> implement
         public long writeOpenedMarker(OnDiskAtom firstColumn, DataOutput out, OnDiskAtom.Serializer atomSerializer) throws IOException
         {
             long size = 0;
-            if (ranges.isEmpty())
+            if (maxOrderingSet.isEmpty())
                 return size;
 
             /*
@@ -152,7 +151,7 @@ public class RangeTombstone extends Interval<ByteBuffer, DeletionTime> implement
              */
             List<RangeTombstone> toWrite = new LinkedList<RangeTombstone>();
             outer:
-            for (RangeTombstone tombstone : ranges)
+            for (RangeTombstone tombstone : maxOrderingSet)
             {
                 // If ever the first column is outside the range, skip it (in
                 // case update() hasn't been called yet)
@@ -215,7 +214,6 @@ public class RangeTombstone extends Interval<ByteBuffer, DeletionTime> implement
                     if (tombstone.data.equals(t.data))
                         return;
                 }
-                ranges.addLast(t);
                 maxOrderingSet.add(t);
                 if (isExpired)
                     expired.add(t);
@@ -231,7 +229,6 @@ public class RangeTombstone extends Interval<ByteBuffer, DeletionTime> implement
                     {
                         // That tombstone is now useless
                         iter.remove();
-                        ranges.remove(tombstone);
                     }
                     else
                     {
@@ -245,10 +242,17 @@ public class RangeTombstone extends Interval<ByteBuffer, DeletionTime> implement
 
         public boolean isDeleted(Column column)
         {
-            for (RangeTombstone tombstone : ranges)
+            RangeTombstone t = new RangeTombstone(column.name(), column.name(), column.timestamp(), 0);
+            for (RangeTombstone tombstone : maxOrderingSet.tailSet(t, true))
             {
+                int cmp = comparator.compare(column.name(), tombstone.max);
+                if (cmp > 0)
+                {
+                    break;
+                }
+
                 if (comparator.compare(column.name(), tombstone.min) >= 0
-                    && comparator.compare(column.name(), tombstone.max) <= 0
+                    && cmp <= 0
                     && tombstone.maxTimestamp() >= column.timestamp())
                 {
                     return true;
