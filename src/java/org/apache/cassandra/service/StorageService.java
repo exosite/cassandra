@@ -3880,6 +3880,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         return DatabaseDescriptor.getPartitionerName();
     }
 
+    public int getTombstoneWarnMessageLen()
+    {
+        return DatabaseDescriptor.getTombstoneWarnMessageLen();
+    }
+
+    public void setTombstoneWarnMessageLen(int messageLen)
+    {
+        DatabaseDescriptor.setTombstoneWarnMessageLen(messageLen);
+    }
+
     public int getTombstoneWarnThreshold()
     {
         return DatabaseDescriptor.getTombstoneWarnThreshold();
