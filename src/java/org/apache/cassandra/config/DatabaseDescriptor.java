@@ -948,6 +948,16 @@ public class DatabaseDescriptor
         return conf.commitlog_directory;
     }
 
+    public static int getTombstoneWarnMessageLen()
+    {
+        return conf.tombstone_warn_message_len;
+    }
+
+    public static void setTombstoneWarnMessageLen(int messageLen)
+    {
+        conf.tombstone_warn_message_len = messageLen;
+    }
+
     public static int getTombstoneWarnThreshold()
     {
         return conf.tombstone_warn_threshold;

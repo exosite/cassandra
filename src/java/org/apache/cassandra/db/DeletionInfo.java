@@ -25,6 +25,7 @@ import java.util.*;
 
 import com.google.common.base.Objects;
 import com.google.common.collect.Iterators;
+import org.apache.cassandra.config.DatabaseDescriptor;
 
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.io.IVersionedSerializer;
@@ -300,8 +301,9 @@ public class DeletionInfo
         StringBuilder sb = new StringBuilder();
         AbstractType at = (AbstractType)ranges.comparator();
         assert at != null;
+        int maxLen = DatabaseDescriptor.getTombstoneWarnMessageLen();
         Iterator<RangeTombstone> iter = rangeIterator();
-        while (iter.hasNext())
+        while (iter.hasNext() && sb.length() < maxLen)
         {
             RangeTombstone i = iter.next();
             sb.append("[");
@@ -310,6 +312,12 @@ public class DeletionInfo
             sb.append(i.data);
             sb.append("]");
         }
+
+        if (sb.length() > maxLen)
+        {
+            sb.append("... truncated (see tombstone_warn_message_len)");
+        }
+
         return sb.toString();
     }
 
